@@ -58,7 +58,6 @@ range=$(awk -F '\t' -v q="$key" '
     }
 ' $idx)
 
-echo "looking into range "$range
 set -- $range
 start=$1
 len=$2
