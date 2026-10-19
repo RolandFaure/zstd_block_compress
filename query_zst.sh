@@ -1,6 +1,20 @@
 #!/bin/sh
 # query_zst.sh index.tsv framed.zst key
-# Prints every line from framed.zst whose third column equals key.
+#
+# Looks up KEY in FRAMED.zst, a file made of independently compressed zstd
+# frames, using INDEX.tsv (one line per frame: first key <TAB> byte offset,
+# sorted by key in byte order, newline-terminated, no header).
+#
+# The index is binary-searched by byte position directly on disk, so a
+# lookup reads about log2(index size) lines instead of the whole index.
+#
+# Output (stdout):
+#   - one "search:" line per binary-search step, then the chosen frame
+#   - then the matching records:
+#       *.tsv* data: lines whose first tab-separated field equals KEY
+#       otherwise:   lines ending in KEY, plus the line after each (grep -A 1)
+#
+# Keys are always compared as text, in byte order (LC_ALL=C).
 
 set -e
 LC_ALL=C
@@ -8,65 +22,147 @@ export LC_ALL
 
 prog=$(basename "$0")
 
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit 1
+}
+
 usage() {
     printf 'Usage: %s index.tsv framed.zst key\n' "$prog" >&2
     exit 1
 }
 
 need_cmd() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        printf '%s: required command "%s" not found\n' "$prog" "$1" >&2
-        exit 1
-    fi
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || die "required command \"$c\" not found"
+    done
+}
+
+filesize() {
+    wc -c < "$1" | tr -d ' \t'
 }
 
 # ----- arguments ---------------------------------------------------------
 [ "$#" -eq 3 ] || usage
-idx="$1"
-framed="$2"
-key="$3"
+idx=$1
+framed=$2
+key=$3
 
-[ -f "$idx" ]    || { printf '%s: index not found: %s\n' "$prog" "$idx" >&2; exit 1; }
-[ -f "$framed" ] || { printf '%s: framed file not found: %s\n' "$prog" "$framed" >&2; exit 1; }
+[ -f "$idx" ]    || die "index not found: $idx"
+[ -f "$framed" ] || die "framed file not found: $framed"
+[ -s "$idx" ]    || die "empty index: $idx"
 
-need_cmd zstd
-need_cmd awk
-need_cmd tail
-need_cmd head
+need_cmd zstd awk tail head wc tr grep
 
-# ----- binary search in the index ----------------------------------------
-# Find the rightmost frame whose first key is <= the query key.
-range=$(awk -F '\t' -v q="$key" '
-    { keys[NR] = $1; offs[NR] = $2 }
-    END {
-        n = NR
-        if (n < 1) { print "error: empty index" > "/dev/stderr"; exit 1 }
+idx_size=$(filesize "$idx")
+data_size=$(filesize "$framed")
 
-        lo = 1; hi = n; ans = 0
-        while (lo <= hi) {
-            mid = int((lo + hi) / 2)
-            if (keys[mid] <= q) { ans = mid; lo = mid + 1 }
-            else                { hi = mid - 1 }
+# The key is passed to awk through the environment (no backslash mangling)
+# and every comparison concatenates "" so it is always a string comparison.
+QZ_KEY=$key
+export QZ_KEY
+
+# fd 3 = real stdout, so awk can print search steps even when its other
+# output is captured by $(...).
+exec 3>&1
+
+# ----- binary search on the index file, by byte position -----------------
+# Invariant:
+#   lo = byte offset of a line start whose key is <= KEY
+#   hi = byte position such that the first line starting at or after hi
+#        has a key > KEY, or there is no such line (hi = file size)
+# When hi = lo + 1, no line starts between them, so the line at lo is the
+# rightmost frame whose first key is <= KEY.
+
+# The first line must qualify, otherwise the key precedes every frame.
+if ! head -n 1 "$idx" | awk -F '\t' '
+    NR == 1 {
+        q = ENVIRON["QZ_KEY"] ""
+        if (($1 "") <= q) {
+            printf "search: start: first_key=\"%s\" <= \"%s\"\n", $1, q
+            exit 0
         }
+        printf "search: start: first_key=\"%s\" > \"%s\" -> no frame can contain the key\n", $1, q
+        exit 1
+    }'
+then
+    die "key sorts before the first frame"
+fi
 
-        if (ans == 0) { print "error: key is before the first frame" > "/dev/stderr"; exit 1 }
+lo=0
+hi=$idx_size
+step=0
 
-        start   = offs[ans]
-        nextoff = (ans < n) ? offs[ans + 1] : offs[NR]
-        len     = nextoff - start
+while [ $((hi - lo)) -gt 1 ]; do
+    mid=$(( (lo + hi) / 2 ))
+    step=$((step + 1))
+
+    # Read from byte mid-1: the first (possibly empty) fragment is the rest
+    # of the line that byte belongs to, the second line is the first line
+    # starting at or after mid. tail -c on a regular file seeks, so this
+    # costs a couple of lines of I/O, not the whole file.
+    probe=$(tail -c +"$mid" "$idx" | head -n 2 | awk -F '\t' \
+        -v lo="$lo" -v hi="$hi" -v mid="$mid" -v step="$step" '
+        NR == 1 { s = mid - 1 + length($0) + 1; next }
+        NR == 2 { found = 1; k = $1 "" }
+        END {
+            q   = ENVIRON["QZ_KEY"] ""
+            out = "cat >&3"
+            if (!found) {
+                printf "search: step %d: lo=%d hi=%d mid=%d no line starts after mid -> go left\n", \
+                    step, lo, hi, mid | out
+                print "left"
+            } else if (k <= q) {
+                printf "search: step %d: lo=%d hi=%d mid=%d line@%d first_key=\"%s\" <= \"%s\" -> go right\n", \
+                    step, lo, hi, mid, s, k, q | out
+                print "right", s
+            } else {
+                printf "search: step %d: lo=%d hi=%d mid=%d line@%d first_key=\"%s\" > \"%s\" -> go left\n", \
+                    step, lo, hi, mid, s, k, q | out
+                print "left"
+            }
+            close(out)
+        }')
+
+    set -- $probe
+    if [ "$1" = right ]; then
+        lo=$2
+    else
+        hi=$mid
+    fi
+done
+
+# ----- frame offset and length --------------------------------------------
+# The line at lo is the chosen frame; the next line (if any) gives its end.
+range=$(tail -c +"$((lo + 1))" "$idx" | head -n 2 | awk -F '\t' \
+    -v size="$data_size" -v prog="$prog" -v lo="$lo" '
+    NR == 1 { k = $1; start = $2 + 0 }
+    NR == 2 { end = $2 + 0 }
+    END {
+        if (NR < 2) end = size + 0
+        len = end - start
+        printf "search: chosen frame at index byte %s: first_key=\"%s\", offset %d, length %d bytes\n", \
+            lo, k, start, len | "cat >&3"
+        close("cat >&3")
+        if (len <= 0) {
+            print prog ": bad index: frame has non-positive length" | "cat >&2"
+            exit 1
+        }
         print start, len
-    }
-' $idx)
+    }')
 
 set -- $range
 start=$1
 len=$2
 
 # ----- extract that one frame and filter ---------------------------------
-if [[ $framed == *.tsv* ]]; then
-    tail -c +$((start + 1)) "$framed" | head -c "$len" | zstd -dc | \
-    	awk -v k="$key" '$1 == k'
-else
-    tail -c +$((start + 1)) "$framed" | head -c "$len" | zstd -dc | \
-        grep -A 1 "$key$"
-fi
+case $framed in
+    *.tsv*)
+        tail -c +"$((start + 1))" "$framed" | head -c "$len" | zstd -dc |
+            awk -F '\t' 'BEGIN { k = ENVIRON["QZ_KEY"] "" } ($1 "") == k'
+        ;;
+    *)
+        tail -c +"$((start + 1))" "$framed" | head -c "$len" | zstd -dc |
+            grep -A 1 -e "$key\$"
+        ;;
+esac
