@@ -79,7 +79,6 @@ if ! head -n 1 "$idx" | awk -F '\t' '
     NR == 1 {
         q = ENVIRON["QZ_KEY"] ""
         if (($1 "") <= q) {
-            printf "search: start: first_key=\"%s\" <= \"%s\"\n", $1, q
             exit 0
         }
         printf "search: start: first_key=\"%s\" > \"%s\" -> no frame can contain the key\n", $1, q
@@ -109,15 +108,12 @@ while [ $((hi - lo)) -gt 1 ]; do
             q   = ENVIRON["QZ_KEY"] ""
             out = "cat >&3"
             if (!found) {
-                printf "search: step %d: lo=%d hi=%d mid=%d no line starts after mid -> go left\n", \
                     step, lo, hi, mid | out
                 print "left"
             } else if (k <= q) {
-                printf "search: step %d: lo=%d hi=%d mid=%d line@%d first_key=\"%s\" <= \"%s\" -> go right\n", \
                     step, lo, hi, mid, s, k, q | out
                 print "right", s
             } else {
-                printf "search: step %d: lo=%d hi=%d mid=%d line@%d first_key=\"%s\" > \"%s\" -> go left\n", \
                     step, lo, hi, mid, s, k, q | out
                 print "left"
             }
@@ -141,7 +137,6 @@ range=$(tail -c +"$((lo + 1))" "$idx" | head -n 2 | awk -F '\t' \
     END {
         if (NR < 2) end = size + 0
         len = end - start
-        printf "search: chosen frame at index byte %s: first_key=\"%s\", offset %d, length %d bytes\n", \
             lo, k, start, len | "cat >&3"
         close("cat >&3")
         if (len <= 0) {
