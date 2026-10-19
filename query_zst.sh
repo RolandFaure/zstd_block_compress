@@ -112,7 +112,7 @@ len=$2
 case $framed in
     *.tsv*)
         tail -c +"$((start + 1))" "$framed" | head -c "$len" | zstd -dc |
-            awk -F '\t' 'BEGIN { k = ENVIRON["QZ_KEY"] "" } ($1 "") == k'
+            awk 'BEGIN { k = ENVIRON["QZ_KEY"] "" } ($1 "") == k'
         ;;
     *)
         tail -c +"$((start + 1))" "$framed" | head -c "$len" | zstd -dc |
